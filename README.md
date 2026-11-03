@@ -1,5 +1,7 @@
 # Drivewalker
 
+<img src="assets/drivewalker-icon.png" alt="Drivewalker icon" width="128">
+
 `dw` measures disk hotspots and cleans regenerable project dependencies and user
 caches. Native Rust, one binary, no shell-based directory walks or per-folder
 subprocesses. Built for macOS; the filesystem core uses Unix directory descriptors.
