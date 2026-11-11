@@ -1,6 +1,6 @@
 use crate::{
     Issue, absolute, pool,
-    unix::Dir,
+    unix::{Dir, Stat},
     work::{Scheduling, Tracker},
 };
 use anyhow::{Context, Result, ensure};
@@ -10,7 +10,10 @@ use std::{
     cmp::Reverse,
     collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Instant,
 };
 
@@ -39,7 +42,7 @@ pub struct ScanReport {
     pub scheduling: Scheduling,
     pub hotspots: Vec<Hotspot>,
     #[serde(skip)]
-    directories: BTreeMap<PathBuf, DirectorySnapshot>,
+    pub(crate) directories: BTreeMap<PathBuf, DirectorySnapshot>,
     pub accounting: &'static str,
 }
 
@@ -56,11 +59,11 @@ pub struct EntrySummary {
 }
 
 #[derive(Debug)]
-struct DirectorySnapshot {
-    allocated_bytes: u64,
-    entries: u64,
-    children: Vec<EntrySummary>,
-    total_children: usize,
+pub(crate) struct DirectorySnapshot {
+    pub(crate) allocated_bytes: u64,
+    pub(crate) entries: u64,
+    pub(crate) children: Vec<EntrySummary>,
+    pub(crate) total_children: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -134,6 +137,7 @@ struct Walker<'a> {
     directories: Option<Mutex<BTreeMap<PathBuf, DirectorySnapshot>>>,
     issues: Mutex<Vec<Issue>>,
     seen: Mutex<HashSet<(u64, u64)>>,
+    progress: Option<&'a AtomicU64>,
 }
 
 impl Walker<'_> {
@@ -160,17 +164,18 @@ impl Walker<'_> {
                 return usage;
             }
         }
-        let names = match dir.names() {
-            Ok(names) => names,
+        let listing = match dir.list() {
+            Ok(listing) => listing,
             Err(error) => {
                 self.issue(path, error);
                 return usage;
             }
         };
-        let results: Vec<Usage> = names
+        let results: Vec<Usage> = listing
             .par_iter()
-            .filter_map(|name| {
+            .filter_map(|listed| {
                 self.work.record();
+                let name = &listed.name;
                 let child = path.join(name);
                 if self
                     .excludes
@@ -179,30 +184,44 @@ impl Walker<'_> {
                 {
                     return None;
                 }
-                let stat = match dir.entry(name) {
-                    Ok(stat) => stat,
+                // Most entries arrive already described by the directory read;
+                // the rest are inspected individually, never through a link.
+                let inspect = || match dir.entry(name) {
+                    Ok(stat) => Some(stat),
                     Err(error) => {
                         self.issue(&child, error);
-                        return None;
+                        None
                     }
+                };
+                let mut stat = match listed.known {
+                    Some(known) => Stat::known(known),
+                    None => inspect()?,
                 };
                 if stat.identity.dev != device {
                     return None;
                 }
                 if stat.directory {
-                    match dir.child(name) {
-                        Ok(opened) => {
-                            if opened.stat().map(|s| s.identity).ok() != Some(stat.identity) {
-                                self.issue(&child, "directory changed while scanning");
-                                return None;
-                            }
-                            Some(self.walk(opened, &child, depth.saturating_sub(1), device))
-                        }
+                    let opened = match dir.child(name) {
+                        Ok(opened) => opened,
                         Err(error) => {
                             self.issue(&child, error);
-                            None
+                            return None;
+                        }
+                    };
+                    let actual = opened.stat().map(|s| s.identity).ok();
+                    if actual != Some(stat.identity) && listed.known.is_some() {
+                        // The listing and the opened directory disagree; decide
+                        // from a direct inspection, as for an undescribed entry.
+                        stat = inspect()?;
+                        if stat.identity.dev != device {
+                            return None;
                         }
                     }
+                    if !stat.directory || actual != Some(stat.identity) {
+                        self.issue(&child, "directory changed while scanning");
+                        return None;
+                    }
+                    Some(self.walk(opened, &child, depth.saturating_sub(1), device))
                 } else {
                     // Count multiply linked files once; most files need no hash-table entry.
                     let duplicate = stat.links > 1
@@ -221,6 +240,9 @@ impl Walker<'_> {
                 }
             })
             .collect();
+        if let Some(progress) = self.progress {
+            progress.fetch_add(results.len() as u64, Ordering::Relaxed);
+        }
         if let Some(directories) = &self.directories {
             let allocated_bytes = results.iter().fold(usage.allocated_bytes, |total, child| {
                 total.saturating_add(child.allocated_bytes)
@@ -275,6 +297,15 @@ impl Walker<'_> {
 }
 
 pub fn scan(options: &ScanOptions) -> Result<ScanReport> {
+    scan_with_progress(options, None)
+}
+
+/// Like [`scan`], and adds every measured entry to `progress` as directories
+/// complete, so a caller can show activity from another thread.
+pub fn scan_with_progress(
+    options: &ScanOptions,
+    progress: Option<&AtomicU64>,
+) -> Result<ScanReport> {
     ensure!(
         !options.roots.is_empty(),
         "at least one scan root is required"
@@ -322,6 +353,7 @@ pub fn scan(options: &ScanOptions) -> Result<ScanReport> {
         excludes: &excludes,
         issues: Mutex::new(vec![]),
         seen: Mutex::new(HashSet::new()),
+        progress,
     };
     let roots = pool(options.jobs)?.install(|| {
         roots
@@ -381,6 +413,7 @@ pub(crate) fn measure(
         excludes,
         issues: Mutex::new(vec![]),
         seen: Mutex::new(HashSet::new()),
+        progress: None,
     };
     let bytes = walker.walk(dir, path, 0, device).allocated_bytes;
     (bytes, walker.issues.into_inner().unwrap())

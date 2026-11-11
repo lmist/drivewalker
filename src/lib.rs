@@ -2,6 +2,7 @@
 #![cfg(unix)]
 
 pub mod clean;
+pub mod deep;
 pub mod plan;
 pub mod platform;
 pub mod policy;
@@ -14,8 +15,9 @@ use serde::Serialize;
 use std::path::PathBuf;
 
 pub use clean::{CleanReport, apply};
+pub use deep::{Analysis, Avenue, DeepOptions, Effect};
 pub use plan::{Candidate, CandidateKind, CleanKind, CleanOptions, CleanPlan, plan};
-pub use scan::{ScanOptions, ScanReport, scan};
+pub use scan::{ScanOptions, ScanReport, scan, scan_with_progress};
 pub use work::Scheduling;
 
 #[derive(Debug, Clone, Serialize)]

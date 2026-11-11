@@ -1,10 +1,17 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use drivewalker::{
-    CleanKind, CleanOptions, ScanOptions, apply, plan, platform::macos, report, scan,
+    CleanKind, CleanOptions, DeepOptions, ScanOptions, ScanReport, apply, plan, platform::macos,
+    report, scan_with_progress,
 };
 use serde::Serialize;
-use std::{path::PathBuf, process::ExitCode};
+use std::{
+    io::IsTerminal,
+    path::PathBuf,
+    process::ExitCode,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    time::Duration,
+};
 
 #[derive(Parser)]
 #[command(
@@ -30,6 +37,8 @@ struct Cli {
 enum Command {
     /// Measure allocated space; default root is your home directory.
     Scan(ScanArgs),
+    /// Follow the space all the way down: whole disk by default, any depth.
+    Deep(DeepArgs),
     /// Preview cleanup. Files are removed only with --apply.
     Clean(CleanArgs),
 }
@@ -51,6 +60,69 @@ struct ScanArgs {
     /// Progressively expand this many largest branches using retained measurements.
     #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u8).range(0..=64))]
     drill: u8,
+}
+
+#[derive(Args)]
+struct DeepArgs {
+    /// Directories to analyse. Default: every folder of the Data volume.
+    paths: Vec<PathBuf>,
+    /// Smallest entry given its own line, e.g. 500M or 2G. Default: 0.5% of the total.
+    #[arg(long, value_parser = size)]
+    min_size: Option<u64>,
+    /// Rows in each ranked list.
+    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u8).range(1..=64))]
+    top: u8,
+}
+
+fn size(text: &str) -> Result<u64, String> {
+    let text = text.trim();
+    let split = text
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(text.len());
+    let number: f64 = text[..split]
+        .parse()
+        .map_err(|_| format!("expected a size such as 500M or 2G, got {text:?}"))?;
+    let unit = text[split..].trim().to_ascii_lowercase();
+    let scale = match unit.trim_end_matches("ib").trim_end_matches('b') {
+        "" => 1u64,
+        "k" => 1 << 10,
+        "m" => 1 << 20,
+        "g" => 1 << 30,
+        "t" => 1 << 40,
+        _ => return Err(format!("unknown size unit in {text:?}; use K, M, G or T")),
+    };
+    Ok((number * scale as f64) as u64)
+}
+
+/// Scan while reporting the running entry count on an interactive stderr.
+fn measure(options: &ScanOptions) -> Result<ScanReport> {
+    if !std::io::stderr().is_terminal() {
+        return scan_with_progress(options, None);
+    }
+    let (count, done) = (AtomicU64::new(0), AtomicBool::new(false));
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !done.load(Ordering::Relaxed) {
+                eprint!("\r  {} entries measured…", count.load(Ordering::Relaxed));
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            eprint!("\r\x1b[2K");
+        });
+        let result = scan_with_progress(options, Some(&count));
+        done.store(true, Ordering::Relaxed);
+        result
+    })
+}
+
+#[derive(Serialize)]
+struct DeepReport {
+    volumes: Vec<macos::Volume>,
+    local_snapshots: Option<Vec<String>>,
+    analysis: drivewalker::Analysis,
+    issues: Vec<drivewalker::Issue>,
+    elapsed_seconds: f64,
+    scheduling: drivewalker::Scheduling,
+    accounting: &'static str,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -109,7 +181,7 @@ fn run(cli: Cli) -> Result<bool> {
                 vec![args.path.unwrap_or(home)]
             };
             eprintln!("Measuring {} root(s)…", roots.len());
-            let mut usage = scan(&ScanOptions {
+            let mut usage = measure(&ScanOptions {
                 roots,
                 excludes: cli.exclude,
                 depth: args.depth as usize,
@@ -140,6 +212,51 @@ fn run(cli: Cli) -> Result<bool> {
                 }
                 Ok(partial)
             }
+        }
+        Command::Deep(args) => {
+            let layout = report::Layout::detect(home.clone());
+            let machine = args.paths.is_empty();
+            let roots = if machine {
+                let roots = macos::machine_roots();
+                if roots.is_empty() { vec![home] } else { roots }
+            } else {
+                args.paths
+            };
+            eprintln!("Measuring {} root(s) to full depth…", roots.len());
+            let usage = measure(&ScanOptions {
+                roots,
+                excludes: cli.exclude,
+                depth: 0,
+                jobs: cli.jobs,
+            })?;
+            let analysis = usage.deep(DeepOptions {
+                min_bytes: args.min_size,
+                top: args.top as usize,
+            });
+            let volumes = usage
+                .roots
+                .first()
+                .map(|root| macos::volumes(&root.path))
+                .unwrap_or_default();
+            let snapshots = machine.then(macos::local_snapshots).flatten();
+            let partial = !usage.issues.is_empty();
+            if cli.json {
+                json(&DeepReport {
+                    volumes,
+                    local_snapshots: snapshots,
+                    analysis,
+                    issues: usage.issues,
+                    elapsed_seconds: usage.elapsed_seconds,
+                    scheduling: usage.scheduling,
+                    accounting: usage.accounting,
+                })?;
+            } else {
+                print!(
+                    "{}",
+                    report::deep(&analysis, &volumes, snapshots.as_deref(), &usage, &layout)
+                );
+            }
+            Ok(partial)
         }
         Command::Clean(args) => {
             let kind = match args.kind {

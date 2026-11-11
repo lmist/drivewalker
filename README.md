@@ -18,6 +18,10 @@ dw scan ~/gts --drill 0          # Disable automatic hotspot expansion
 dw scan --machine               # Disjoint system/home roots + APFS/snapshot context
 dw scan ~/gts --json             # Full structured report at the requested depth
 
+dw deep                         # Whole disk, followed down to wherever the space sits
+dw deep ~/gts ~/Library          # Same analysis for chosen directories
+dw deep --min-size 500M --top 40 # Go deeper: smaller entries, longer rankings
+
 dw clean caches                 # Preview known user caches
 dw clean projects ~/gts          # Preview Node/Python dependency and bytecode folders
 dw clean all ~/gts               # User caches + dependencies under this project root
@@ -37,6 +41,79 @@ is untruncated at the requested display depth. Adaptive `hotspots` are separatel
 bounded and include an `omitted_children` count.
 Display depth does not limit measurement: calculating a directory's size requires
 visiting its descendants. `scan --depth 0 --drill 0` returns root totals only.
+
+## Deep analysis
+
+`dw deep` answers "what is using this disk" in one pass. Without paths it measures
+every top-level folder of the Data volume, including system data that `scan
+--machine` does not visit, and compares the result with what each volume in the
+container reports as used. The report has six parts:
+
+- **Disk**: used space per volume of the container, free space, and the gap
+  between measured and used (unreadable folders, snapshots, purgeable space).
+- **Where the space is**: a tree of every entry at or above `--min-size`, at any
+  depth. A chain of single dominant children is joined on one line, so a 12 GiB
+  file nine levels down appears as one row. Each directory ends with a summary of
+  what stayed below the threshold and names its three largest such entries.
+- **Where it ends up**: a ranked list of space that does not split further at the
+  threshold: single files, bundles, and directories of many small entries.
+- **By kind**: totals for recognisable directories wherever they occur
+  (`node_modules`, Python environments, Cargo `target`, caches, package stores,
+  `.git`, Xcode data, simulators, container images, application bundles,
+  language toolchains, globally installed packages, installers, Trash), each
+  with how to remove it. Only the outermost match is counted, so nested copies
+  are not added twice.
+- **Largest files** and **Not measured**: the latter groups unreadable locations
+  by cause and says whether Full Disk Access or `sudo` would include them.
+- **What can go**: the closing list, numbered so a row can be referred to by
+  its number. One bordered table per outcome, each row giving item, path and
+  size:
+
+  ```text
+  Stays freed · 8.2 GiB · nothing recreates it and nothing of yours is lost
+  ┌───┬───────────────────┬──────────────────────────────────────────┬──────┐
+  │ # │ Item              │ Path                                     │  GiB │
+  ├───┼───────────────────┼──────────────────────────────────────────┼──────┤
+  │ 1 │ Simulators        │ /System/Volu…_iOSSimulatorRuntime        │  8.2 │
+  └───┴───────────────────┴──────────────────────────────────────────┴──────┘
+
+  Grows back · 18.1 GiB · a build, install or launch recreates it
+  ┌───┬───────────────────┬──────────────────────────────────────────┬──────┐
+  │ # │ Item              │ Path                                     │  GiB │
+  ├───┼───────────────────┼──────────────────────────────────────────┼──────┤
+  │ 2 │ Cache folder      │ ~/Library/Caches                         │ 10.4 │
+  │ 3 │ Node dependencies │ 344 smaller locations in ~               │  7.7 │
+  └───┴───────────────────┴──────────────────────────────────────────┴──────┘
+
+  Your call · 6.6 GiB · applications, tools, history and your own files
+  ┌───┬───────────────────┬──────────────────────────────────────────┬──────┐
+  │ # │ Item              │ Path                                     │  GiB │
+  ├───┼───────────────────┼──────────────────────────────────────────┼──────┤
+  │ 4 │ Application       │ /Applications/Big.app                    │  4.5 │
+  │ 5 │ File              │ ~/Movies/film.mp4                        │  2.1 │
+  └───┴───────────────────┴──────────────────────────────────────────┴──────┘
+  ```
+
+  A recognised location of at least `--min-size` has its own row and the
+  smaller ones of its kind share one. The `--top` largest unrecognised files
+  and folders follow as your call. Rows are ordered by outcome, then size, and
+  never overlap: a folder counts only the bytes no other row has claimed, so
+  the sizes add up. Regenerable data inside system or package-manager
+  locations (`/Library`, `/opt`, `/System`, …) is totalled by kind but not
+  offered, and unrecognised contents of those locations are never listed.
+  The home directory is written as `~`, sizes share the unit of the largest
+  row, and paths are shortened in the middle to fit `$COLUMNS` or the
+  terminal; piped output keeps them whole. Numbers belong to one report; a
+  later run may order rows differently. The list is a report, not a plan:
+  `dw clean` still decides what it may delete, and `--json` carries the same
+  rows as `analysis.avenues`, each with how to remove it.
+
+`--min-size` accepts `K`, `M`, `G` or `T` and defaults to 0.5% of the measured
+total. `--top N` (1–64, default 20) sets the length of each ranking. Application
+bundles, frameworks and photo libraries are reported whole. The analysis reads
+only what the scan retained: `ScanReport::deep(DeepOptions)` performs no
+filesystem I/O. Because each directory retains its 64 largest children, the
+largest-files ranking is exact up to 64 rows.
 
 ## Adaptive work distribution
 
@@ -111,6 +188,11 @@ and executes it; JSON output is a report, not an executable plan file.
 - Handles prevent symlink redirection, not all concurrent rename races. An opened
   directory moved during cleanup may have contents removed before the move is
   detected. Avoid running cleanup alongside directory migrations.
+- On macOS a directory's entries and their block accounting are read together
+  with `getattrlistbulk`, roughly halving scan time. Mount points, firmlinks and
+  entries the kernel does not fully describe are inspected individually, and a
+  directory's identity is still confirmed on its opened descriptor. Other
+  platforms and filesystems without bulk support use `readdir` and `fstatat`.
 - Traversal stays on each root's filesystem. Scans count allocated blocks and
   deduplicate hard links across scan roots. Attribution of shared hard links to
   individual children may vary with parallel traversal. Plan estimates deduplicate
@@ -127,19 +209,22 @@ Exit codes: **0** successful report/cleanup, **1** fatal error, **2** partial re
 ## Library and structure
 
 ```rust,ignore
-use drivewalker::{scan, plan, apply};
+use drivewalker::{DeepOptions, scan, plan, apply};
 
 let mut usage = scan(&scan_options)?;
 usage.expand_hotspots(6, 15); // Uses retained measurements, without filesystem I/O.
+let analysis = usage.deep(DeepOptions::default()); // Tree, kinds, largest files, numbered avenues.
 let cleanup = plan(&clean_options)?;
 // Inspect cleanup.candidates(), cleanup.issues(), cleanup.skipped().
 let result = apply(&cleanup)?;
 ```
 
-`scan` handles traversal/accounting; `policy` selects known targets and protects
+`scan` handles traversal/accounting; `deep` derives the culprit tree, kind totals,
+rankings and the numbered list from a finished scan; `policy` selects known targets and protects
 installations; `plan` discovers, deduplicates, and measures candidates; `clean`
 executes an opaque in-process plan; `unix` contains descriptor operations and the
-unsafe FFI boundary; `work` records bounded-pool participation; `platform/macos` provides volume/snapshot context; `report`
+unsafe FFI boundary; `work` records bounded-pool participation; `platform/macos`
+provides volume, whole-disk root and snapshot context; `report`
 formats human output; `main` handles CLI arguments and exit status.
 
 ```sh
@@ -154,3 +239,8 @@ exclusions, late siblings, partial failures, permissions, and block accounting.
 Adaptive tests cover parallel discovery in a single workspace, parallel deletion
 inside one large/flat target, parent/child ordering, partial sibling failures,
 worker limits, bounded retained rankings, and drill-down after deleting a fixture.
+Deep tests cover reporting at arbitrary depth after the tree is deleted, threshold
+summaries, kind totals without double counting, and grouped unreadable locations.
+They also cover the numbered list: its order, shared rows for small locations,
+rows that do not overlap, and installed tools never being offered as regenerable.
+A unit test checks that bulk directory reads agree with per-entry inspection.
