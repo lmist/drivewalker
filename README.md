@@ -1,6 +1,8 @@
 # Drivewalker
 
-<img src="assets/drivewalker-icon.png" alt="Drivewalker icon" width="128">
+<p align="center">
+  <img src="assets/drivewalker-icon-masked.png" alt="Drivewalker icon" width="128">
+</p>
 
 `dw` measures disk hotspots and cleans regenerable project dependencies and user
 caches. Native Rust, one binary, no shell-based directory walks or per-folder
