@@ -9,7 +9,7 @@ caches. Native Rust, one binary, no shell-based directory walks or per-folder
 subprocesses. Built for macOS; the filesystem core uses Unix directory descriptors.
 
 ```sh
-cargo install --git https://github.com/oxfern/drivewalker --locked
+cargo install --git https://github.com/lmist/drivewalker --locked
 
 dw scan                         # Home, largest immediate children first
 dw scan ~/gts --depth 2          # Measure once, display another level

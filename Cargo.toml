@@ -3,7 +3,7 @@ name = "drivewalker"
 version = "0.3.0"
 edition = "2024"
 description = "Measure disk hotspots and clean regenerable files with explicit filesystem policies"
-repository = "https://github.com/oxfern/drivewalker"
+repository = "https://github.com/lmist/drivewalker"
 rust-version = "1.85"
 
 [profile.release]
