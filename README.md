@@ -8,6 +8,39 @@
 caches. Native Rust, one binary, no shell-based directory walks or per-folder
 subprocesses. Built for macOS; the filesystem core uses Unix directory descriptors.
 
+```console
+$ dw
+       ___________________
+      /  .-"""""""""""-.  \
+     /  (               )  \
+    /____'-._________.-'____\
+   |                         |
+   |    (===============)    |
+    \_______________________/
+    /  / |_|         |_| \  \
+   / |/ /__|         |__\ \| \
+  / |/                     \| \
+_/__/__                   __\__\_
+|_____|                   |_____|
+
+Find disk hotspots and clean regenerable files safely
+
+Usage: dw [OPTIONS] <COMMAND>
+
+Commands:
+  scan   Measure allocated space; default root is your home directory
+  deep   Follow the space all the way down: whole disk by default, any depth
+  clean  Preview cleanup. Files are removed only with --apply
+  help   Print this message or the help of the given subcommand(s)
+
+Options:
+      --json               Emit structured JSON to stdout
+      --exclude <EXCLUDE>  Exclude a path relative to the working directory, or an absolute path. Repeatable
+      --jobs <JOBS>        Maximum worker threads (1–64) [default: 8]
+  -h, --help               Print help
+  -V, --version            Print version
+```
+
 ```sh
 cargo install --git https://github.com/lmist/drivewalker --locked
 
@@ -32,7 +65,8 @@ dw scan ~/gts --exclude ~/gts/archive --jobs 4
 dw clean projects ~/gts --exclude ~/gts/active-app/node_modules
 ```
 
-For a local checkout, use `cargo install --path . --locked`.
+For a local checkout, use `cargo install --path . --locked`. `dw` on its own, or
+`dw --help`, prints the logo and the list of commands shown above.
 
 Global flags: `--json`, repeatable `--exclude PATH`, `--jobs 1..64` (default 8).
 Relative paths, including exclusions, resolve against the working directory.

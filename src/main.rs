@@ -13,11 +13,38 @@ use std::{
     time::Duration,
 };
 
+/// The icon as text: a disk carried on four legs. `=` is the orange light
+/// and `#` marks the blue stripe down each front leg.
+const LOGO: &str = r#"
+       ___________________
+      /  .-"""""""""""-.  \
+     /  (               )  \
+    /____'-._________.-'____\
+   |                         |
+   |    (===============)    |
+    \_______________________/
+    /  / |_|         |_| \  \
+   / #/ /__|         |__\ \# \
+  / #/                     \# \
+_/__/__                   __\__\_
+|_____|                   |_____|"#;
+
+/// The logo in the icon's colours. The help writer drops them when its output
+/// is not a colour terminal.
+fn logo() -> String {
+    let light = "=".repeat(15);
+    LOGO.trim_start_matches('\n')
+        .replace(&light, &format!("\x1b[38;5;214m{light}\x1b[39m"))
+        .replace('#', "\x1b[38;5;75m|\x1b[39m")
+}
+
 #[derive(Parser)]
 #[command(
     name = "dw",
     version,
-    about = "Find disk hotspots and clean regenerable files safely"
+    about = "Find disk hotspots and clean regenerable files safely",
+    before_help = logo(),
+    arg_required_else_help = true
 )]
 struct Cli {
     #[command(subcommand)]

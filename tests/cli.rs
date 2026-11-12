@@ -158,3 +158,34 @@ fn cli_deep_reports_json_text_and_rejects_bad_sizes() {
     );
     assert_eq!(run(&["deep", path, "--top", "0"]).status.code(), Some(2));
 }
+
+#[test]
+fn cli_shows_the_logo_with_the_top_level_help() {
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_dw"))
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let light = "(===============)";
+
+    // `dw --help`: the logo above the help, without colour codes when piped.
+    let help = run(&["--help"]);
+    assert!(help.status.success());
+    let text = String::from_utf8(help.stdout).unwrap();
+    let logo = text.find(light).expect("logo");
+    assert!(logo < text.find("Usage: dw").expect("usage"), "{text}");
+    assert!(!text.contains('\x1b'), "{text}");
+
+    // `dw` alone is still a usage error, now answered with the same help.
+    let bare = run(&[]);
+    assert_eq!(bare.status.code(), Some(2));
+    assert!(bare.stdout.is_empty());
+    let text = String::from_utf8(bare.stderr).unwrap();
+    assert!(text.contains(light) && text.contains("Usage: dw"), "{text}");
+
+    // A subcommand's help stays plain.
+    let deep = run(&["deep", "--help"]);
+    assert!(deep.status.success());
+    assert!(!String::from_utf8(deep.stdout).unwrap().contains(light));
+}
