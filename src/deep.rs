@@ -9,6 +9,7 @@ use serde::Serialize;
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BinaryHeap},
+    ffi::OsStr,
     path::{Path, PathBuf},
 };
 
@@ -89,12 +90,14 @@ pub struct Kind {
 }
 
 /// One numbered row of what could be deleted. Rows never overlap, so their
-/// sizes add up.
+/// sizes add up. They are listed in the order they are drawn: by effect, then
+/// kind, then down each kind's tree of shared folders.
 #[derive(Debug, Clone, Serialize)]
 pub struct Avenue {
     /// Position in the list, from 1. Meaningful within this report only.
     pub number: usize,
-    pub item: &'static str,
+    /// What it is, in the words of the by-kind totals.
+    pub kind: &'static str,
     /// The location itself, or the folder that contains all of `locations`.
     pub path: PathBuf,
     /// Bytes that no other row accounts for.
@@ -123,7 +126,7 @@ pub struct Analysis {
     pub kinds: Vec<Kind>,
     pub largest_files: Vec<EntrySummary>,
     pub unreadable: Vec<Unreadable>,
-    /// What could be deleted, numbered, ordered by effect and then by size.
+    /// What could be deleted, numbered in the order it is drawn.
     pub avenues: Vec<Avenue>,
 }
 
@@ -135,27 +138,19 @@ fn bundle(path: &Path) -> bool {
     )
 }
 
-/// A recognisable kind of directory or file: how it is totalled, how one
-/// location of it is named in the numbered list, and what deleting it costs.
+/// A recognisable kind of directory or file: how it is named and totalled, and
+/// what deleting it costs.
 struct Spec {
     label: &'static str,
     hint: &'static str,
-    item: &'static str,
     effect: Effect,
     how: &'static str,
 }
 
-const fn spec(
-    label: &'static str,
-    hint: &'static str,
-    item: &'static str,
-    effect: Effect,
-    how: &'static str,
-) -> Spec {
+const fn spec(label: &'static str, hint: &'static str, effect: Effect, how: &'static str) -> Spec {
     Spec {
         label,
         hint,
-        item,
         effect,
         how,
     }
@@ -172,119 +167,102 @@ const KINDS: &[Spec] = &[
     spec(
         "Node dependencies (node_modules)",
         "regenerable: dw clean projects PATH",
-        "Node dependencies",
         Effect::GrowsBack,
         "dw clean projects PATH",
     ),
     spec(
         "Python environments and bytecode",
         "regenerable: dw clean projects PATH",
-        "Python env or bytecode",
         Effect::GrowsBack,
         "dw clean projects PATH",
     ),
     spec(
         "Rust build output (target)",
         "regenerable: cargo clean in each project",
-        "Rust build output",
         Effect::GrowsBack,
         "cargo clean",
     ),
     spec(
         "JS/Swift/Gradle build and tool caches",
         "regenerable by the next build",
-        "Build or tool cache",
         Effect::GrowsBack,
         "delete; the next build recreates it",
     ),
     spec(
         "Cache folders",
         "regenerable; dw clean caches covers the known user caches",
-        "Cache folder",
         Effect::GrowsBack,
         "dw clean caches, or delete",
     ),
     spec(
         "Package manager stores",
         "re-downloaded on demand; prune with the package manager",
-        "Package store",
         Effect::GrowsBack,
         "prune with the package manager",
     ),
     spec(
         "Git repository data (.git)",
         "history; shrink with git gc or shallow clones",
-        "Git history",
         Effect::YourCall,
         "git gc, or re-clone shallow",
     ),
     spec(
         "Xcode build data",
         "regenerable; Xcode rebuilds it",
-        "Xcode build data",
         Effect::GrowsBack,
         "delete; Xcode rebuilds it",
     ),
     spec(
         "Container and VM disk images",
         "prune images and volumes inside the tool",
-        "Container or VM image",
         Effect::StaysFreed,
         "prune inside the tool",
     ),
     spec(
         "Local AI models",
         "delete models you no longer run",
-        "Local AI model",
         Effect::YourCall,
         "delete models you no longer run",
     ),
     spec(
         "Application bundles",
         "uninstall apps you do not use",
-        "Application",
         Effect::YourCall,
         "uninstall if unused",
     ),
     spec(
         "Trash",
         "empty the Trash",
-        "Trash",
         Effect::StaysFreed,
         "empty the Trash",
     ),
     spec(
         "Simulator runtimes and devices",
         "remove unused ones with xcrun simctl or in Xcode",
-        "Simulators",
         Effect::StaysFreed,
         "xcrun simctl, or Xcode settings",
     ),
     spec(
         "Installers and staged updates",
         "delete once the app is installed",
-        "Installer",
         Effect::StaysFreed,
         "delete once installed",
     ),
     spec(
         "Telemetry backlogs",
         "unsent usage events; delete, and turn the tool's metrics off to stop it",
-        "Telemetry backlog",
         Effect::GrowsBack,
         "delete; turn its metrics off",
     ),
     spec(
         "Language toolchains",
         "remove versions you no longer use with their version manager",
-        "Toolchain",
         Effect::YourCall,
         "remove with its version manager",
     ),
     spec(
         "Globally installed packages",
         "installed tools; uninstall the ones you do not use",
-        "Global packages",
         Effect::YourCall,
         "uninstall with the package manager",
     ),
@@ -532,6 +510,109 @@ fn leaves<'a>(node: &'a Node, out: &mut Vec<&'a Node>) {
     }
 }
 
+/// One line of a kind's compact tree: a folder several rows share, or a row.
+#[derive(Debug)]
+pub struct Branch {
+    /// Absolute at the first level, then relative to the branch above.
+    pub path: PathBuf,
+    pub allocated_bytes: u64,
+    /// Position of the row at this path among the rows given to [`branches`].
+    pub row: Option<usize>,
+    pub children: Vec<Branch>,
+}
+
+type Twig<'a> = (Vec<&'a OsStr>, u64, usize);
+
+/// Leading components all twigs share, leaving each at least one of its own.
+fn shared(twigs: &[Twig]) -> usize {
+    let first = &twigs[0].0;
+    twigs
+        .iter()
+        .map(|(components, ..)| {
+            let same = first.iter().zip(components).take_while(|(a, b)| a == b);
+            same.count().min(components.len() - 1)
+        })
+        .min()
+        .unwrap_or(0)
+}
+
+fn grow(twigs: Vec<Twig>) -> Vec<Branch> {
+    let mut groups: BTreeMap<&OsStr, Vec<Twig>> = BTreeMap::new();
+    for twig in twigs {
+        groups.entry(twig.0[0]).or_default().push(twig);
+    }
+    let mut branches = vec![];
+    for group in groups.into_values() {
+        let depth = shared(&group);
+        // One row, or rows that contain one another: each is its own line.
+        if group.len() == 1 || depth == 0 {
+            branches.extend(group.into_iter().map(|(components, bytes, row)| Branch {
+                path: components.iter().collect(),
+                allocated_bytes: bytes,
+                row: Some(row),
+                children: vec![],
+            }));
+            continue;
+        }
+        let path = group[0].0[..depth].iter().collect();
+        let children = grow(
+            group
+                .into_iter()
+                .map(|(components, bytes, row)| (components[depth..].to_vec(), bytes, row))
+                .collect(),
+        );
+        branches.push(Branch {
+            path,
+            allocated_bytes: children.iter().map(|c| c.allocated_bytes).sum(),
+            row: None,
+            children,
+        });
+    }
+    branches.sort_by(|a, b| {
+        b.allocated_bytes
+            .cmp(&a.allocated_bytes)
+            .then(a.path.cmp(&b.path))
+    });
+    branches
+}
+
+/// Arrange the single-location rows of one kind as a tree of the folders they
+/// share, largest first at every level. Rows that lie together on disk sit
+/// together, and a shared folder is written once. Several rows come back
+/// under the one folder that holds them all. Rows that add several locations
+/// together have no place in the tree.
+pub fn branches(rows: &[Avenue]) -> Vec<Branch> {
+    grow(
+        rows.iter()
+            .enumerate()
+            .filter(|(_, row)| row.locations == 1)
+            .map(|(index, row)| (row.path.iter().collect(), row.allocated_bytes, index))
+            .filter(|(components, ..): &Twig| !components.is_empty())
+            .collect(),
+    )
+}
+
+/// Put one kind's rows in the order its tree is drawn, shared rows last.
+fn arrange(rows: &mut Vec<Avenue>) {
+    fn walk(branches: &[Branch], order: &mut Vec<usize>) {
+        for branch in branches {
+            order.extend(branch.row);
+            walk(&branch.children, order);
+        }
+    }
+    let mut order = vec![];
+    walk(&branches(rows), &mut order);
+    order.extend((0..rows.len()).filter(|index| rows[*index].locations != 1));
+    let mut slots: Vec<Option<Avenue>> = std::mem::take(rows).into_iter().map(Some).collect();
+    *rows = order
+        .into_iter()
+        .filter_map(|index| slots[index].take())
+        .collect();
+}
+
+/// Files and folders nothing recognises, offered as the owner's call.
+pub const OTHER: &str = "Other files and folders";
+
 /// The numbered list of what could go. A recognised location of at least the
 /// threshold gets its own row and the smaller ones of its kind share one.
 /// The largest unrecognised files and folders outside system locations follow
@@ -543,12 +624,12 @@ fn avenues(
     floor: u64,
     top: usize,
 ) -> Vec<Avenue> {
-    let mut rows = vec![];
+    let mut groups: Vec<Vec<Avenue>> = vec![];
     let mut claimed: BTreeMap<&Path, u64> = BTreeMap::new();
     for (locations, spec) in found.iter().zip(KINDS) {
         let row = |path: PathBuf, allocated_bytes: u64, locations: usize| Avenue {
             number: 0,
-            item: spec.item,
+            kind: spec.label,
             path,
             allocated_bytes,
             effect: spec.effect,
@@ -563,11 +644,10 @@ fn avenues(
             .collect();
         let large = offered.partition_point(|l| l.allocated_bytes >= threshold);
         let (large, small) = offered.split_at(large);
-        rows.extend(
-            large
-                .iter()
-                .map(|l| row(l.path.clone(), l.allocated_bytes, 1)),
-        );
+        let mut rows: Vec<Avenue> = large
+            .iter()
+            .map(|l| row(l.path.clone(), l.allocated_bytes, 1))
+            .collect();
         let rest: u64 = small.iter().map(|l| l.allocated_bytes).sum();
         if rest > floor {
             let path = match small {
@@ -575,6 +655,9 @@ fn avenues(
                 _ => common(small),
             };
             rows.push(row(path, rest, small.len()));
+        }
+        if !rows.is_empty() {
+            groups.push(rows);
         }
         claimed.extend(
             locations
@@ -601,7 +684,7 @@ fn avenues(
             let allocated_bytes = node.allocated_bytes.saturating_sub(inside);
             (allocated_bytes >= threshold).then(|| Avenue {
                 number: 0,
-                item: if node.directory { "Folder" } else { "File" },
+                kind: OTHER,
                 path: node.path.clone(),
                 allocated_bytes,
                 effect: Effect::YourCall,
@@ -616,14 +699,23 @@ fn avenues(
             .then(a.path.cmp(&b.path))
     });
     own.truncate(top);
-    rows.extend(own);
+    if !own.is_empty() {
+        groups.push(own);
+    }
 
-    rows.sort_by(|a, b| {
-        a.effect
-            .cmp(&b.effect)
-            .then(b.allocated_bytes.cmp(&a.allocated_bytes))
-            .then(a.path.cmp(&b.path))
+    // By effect, then the kinds that hold most, each in the order of its tree.
+    let total = |rows: &[Avenue]| rows.iter().map(|row| row.allocated_bytes).sum::<u64>();
+    groups.sort_by(|a, b| {
+        a[0].effect
+            .cmp(&b[0].effect)
+            .then(total(b).cmp(&total(a)))
+            .then(a[0].kind.cmp(b[0].kind))
     });
+    let mut rows = vec![];
+    for mut group in groups {
+        arrange(&mut group);
+        rows.append(&mut group);
+    }
     for (index, row) in rows.iter_mut().enumerate() {
         row.number = index + 1;
     }

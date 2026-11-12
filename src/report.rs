@@ -1,6 +1,6 @@
 use crate::{
     CleanPlan, CleanReport, Issue, ScanReport,
-    deep::{Analysis, Effect, Node},
+    deep::{Analysis, Avenue, Branch, Effect, Node, branches},
     platform::macos::Volume,
     scan::Usage,
 };
@@ -229,6 +229,15 @@ impl Layout {
         }
     }
 
+    /// The root, the home directory, or a folder above it.
+    fn holds_everything(&self, folder: &Path) -> bool {
+        folder.parent().is_none()
+            || self
+                .home
+                .as_deref()
+                .is_some_and(|home| home.starts_with(folder))
+    }
+
     fn place(&self, value: &Path) -> String {
         match self
             .home
@@ -255,123 +264,147 @@ fn fit(text: String, width: usize) -> String {
     format!("{start}…{end}")
 }
 
-/// The numbered list comes last so it is what remains on screen: one bordered
-/// table per outcome, all with the same columns.
+/// Fixed left columns of the closing list, and how wide a path may be.
+struct Columns<'a> {
+    layout: &'a Layout,
+    number: usize,
+    size: usize,
+    scale: u64,
+}
+
+impl Columns<'_> {
+    fn size(&self, value: u64) -> String {
+        let value = value as f64 / self.scale as f64;
+        if value > 0.0 && value < 0.05 {
+            "<0.1".into()
+        } else {
+            format!("{value:.1}")
+        }
+    }
+
+    /// A heading carries a total but no number; a row carries both.
+    fn line(&self, out: &mut String, number: Option<usize>, bytes: u64, text: &str) {
+        let number = number.map(|n| n.to_string()).unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "{number:>width$}  {:>size$}  {text}",
+            self.size(bytes),
+            width = self.number,
+            size = self.size,
+        );
+    }
+
+    /// Room left for a path after the columns and `drawn` tree characters.
+    fn fit(&self, text: String, drawn: usize) -> String {
+        match self.layout.columns {
+            Some(columns) => {
+                let used = self.number + self.size + 4 + drawn;
+                fit(text, columns.saturating_sub(used).max(20))
+            }
+            None => text,
+        }
+    }
+
+    fn branches(
+        &self,
+        out: &mut String,
+        branches: &[Branch],
+        rows: &[Avenue],
+        prefix: &str,
+        first_level: bool,
+        more_follows: bool,
+    ) {
+        for (index, branch) in branches.iter().enumerate() {
+            let last = index + 1 == branches.len() && !more_follows;
+            let label = if first_level {
+                self.layout.place(&branch.path)
+            } else {
+                path(&branch.path)
+            };
+            let label = self.fit(label, prefix.chars().count() + 3);
+            let text = format!("{prefix}{} {label}", if last { "└─" } else { "├─" });
+            let number = branch.row.map(|row| rows[row].number);
+            self.line(out, number, branch.allocated_bytes, &text);
+            let deeper = format!("{prefix}{}  ", if last { " " } else { "│" });
+            self.branches(out, &branch.children, rows, &deeper, false, false);
+        }
+    }
+}
+
+/// The numbered list comes last so it is what remains on screen: a tree of
+/// outcome, kind and the folders that rows share, with a number on every row.
 fn avenues(out: &mut String, analysis: &Analysis, layout: &Layout) {
     let rows = &analysis.avenues;
     if rows.is_empty() {
         return;
     }
-    // One unit for the whole column, chosen by the largest row.
-    let largest = rows
-        .iter()
-        .map(|row| row.allocated_bytes)
-        .max()
-        .unwrap_or(0);
+    let total = |rows: &[Avenue]| rows.iter().map(|row| row.allocated_bytes).sum::<u64>();
+    let outcomes: Vec<&[Avenue]> = rows.chunk_by(|a, b| a.effect == b.effect).collect();
+    // One unit for the whole column, chosen by the largest total shown.
+    let largest = outcomes.iter().map(|rows| total(rows)).max().unwrap_or(0);
     let (scale, unit) = [(1u64 << 30, "GiB"), (1 << 20, "MiB"), (1 << 10, "KiB")]
         .into_iter()
         .find(|(scale, _)| largest >= *scale)
         .unwrap_or((1, "B"));
-    let size = |value: u64| {
-        let value = value as f64 / scale as f64;
-        if value > 0.0 && value < 0.05 {
-            "<0.1".to_string()
-        } else {
-            format!("{value:.1}")
-        }
+    let mut columns = Columns {
+        layout,
+        number: rows.len().to_string().len(),
+        size: unit.len(),
+        scale,
     };
-    let cells: Vec<[String; 4]> = rows
-        .iter()
-        .map(|row| {
-            let place = layout.place(&row.path);
-            let place = if row.locations > 1 {
-                // The larger locations of the same item have rows of their own.
-                let listed = rows
-                    .iter()
-                    .any(|other| other.item == row.item && other.number != row.number);
-                format!(
-                    "{} {}locations in {place}",
-                    row.locations,
-                    if listed { "smaller " } else { "" }
-                )
-            } else {
-                place
-            };
-            [
-                row.number.to_string(),
-                row.item.to_string(),
-                place,
-                size(row.allocated_bytes),
-            ]
-        })
-        .collect();
-    let headers = ["#", "Item", "Path", unit];
-    let mut widths = headers.map(|header| header.chars().count());
-    for row in &cells {
-        for (width, cell) in widths.iter_mut().zip(row) {
-            *width = (*width).max(cell.chars().count());
-        }
-    }
-    if let Some(columns) = layout.columns {
-        // Four columns cost thirteen characters of borders and padding.
-        let fixed = widths[0] + widths[1] + widths[3] + 13;
-        widths[2] = widths[2].min(columns.saturating_sub(fixed).max(20));
-    }
-    let rule = |left: &str, middle: &str, right: &str| {
-        let bars: Vec<String> = widths.iter().map(|width| "─".repeat(width + 2)).collect();
-        format!("{left}{}{right}", bars.join(middle))
-    };
-    let line = |cells: [&str; 4]| {
-        format!(
-            "│ {:>number$} │ {:<item$} │ {:<place$} │ {:>size$} │",
-            cells[0],
-            cells[1],
-            fit(cells[2].to_string(), widths[2]),
-            cells[3],
-            number = widths[0],
-            item = widths[1],
-            place = widths[2],
-            size = widths[3],
-        )
-    };
+    columns.size = columns.size.max(columns.size(largest).len());
 
+    let _ = writeln!(out, "\nWhat can go · pick by number · rows do not overlap");
     let _ = writeln!(
         out,
-        "\nWhat can go · numbered to pick from · rows do not overlap · By kind says how"
+        "{:>number$}  {unit:>size$}",
+        "#",
+        number = columns.number,
+        size = columns.size
     );
-    for (effect, title, meaning) in [
-        (
-            Effect::StaysFreed,
-            "Stays freed",
-            "nothing recreates it and nothing of yours is lost",
-        ),
-        (
-            Effect::GrowsBack,
-            "Grows back",
-            "a build, install or launch recreates it",
-        ),
-        (
-            Effect::YourCall,
-            "Your call",
-            "applications, tools, history and your own files",
-        ),
-    ] {
-        let group: Vec<usize> = (0..rows.len())
-            .filter(|index| rows[*index].effect == effect)
-            .collect();
-        if group.is_empty() {
-            continue;
+    for (index, outcome) in outcomes.iter().enumerate() {
+        if index > 0 {
+            let _ = writeln!(out);
         }
-        let total: u64 = group.iter().map(|index| rows[*index].allocated_bytes).sum();
-        let _ = writeln!(out, "\n{title} · {} · {meaning}", bytes(total));
-        let _ = writeln!(out, "{}", rule("┌", "┬", "┐"));
-        let _ = writeln!(out, "{}", line(headers));
-        let _ = writeln!(out, "{}", rule("├", "┼", "┤"));
-        for index in group {
-            let [number, item, place, size] = &cells[index];
-            let _ = writeln!(out, "{}", line([number, item, place, size]));
+        let heading = match outcome[0].effect {
+            Effect::StaysFreed => "Stays freed · nothing recreates it and nothing of yours is lost",
+            Effect::GrowsBack => "Grows back · a build, install or launch recreates it",
+            Effect::YourCall => "Your call · applications, tools, history and your own files",
+        };
+        columns.line(out, None, total(outcome), heading);
+        let kinds: Vec<&[Avenue]> = outcome.chunk_by(|a, b| a.kind == b.kind).collect();
+        for (index, kind) in kinds.iter().enumerate() {
+            let last = index + 1 == kinds.len();
+            let text = format!(
+                "{} {} · {}",
+                if last { "└─" } else { "├─" },
+                kind[0].kind,
+                kind[0].how
+            );
+            columns.line(out, None, total(kind), &text);
+            let prefix = if last { "   " } else { "│  " };
+            // The smaller locations of a kind share its last row.
+            let together = kind.iter().find(|row| row.locations != 1);
+            let mut tree = branches(kind);
+            // A folder that merely holds everything is not worth a line.
+            if tree.len() == 1 && tree[0].row.is_none() && layout.holds_everything(&tree[0].path) {
+                let root = tree.remove(0);
+                tree = root.children;
+                for branch in &mut tree {
+                    branch.path = root.path.join(&branch.path);
+                }
+            }
+            columns.branches(out, &tree, kind, prefix, true, together.is_some());
+            if let Some(row) = together {
+                let place = columns.fit(layout.place(&row.path), prefix.len() + 30);
+                let text = format!(
+                    "{prefix}└─ … {} {}locations in {place}",
+                    row.locations,
+                    if kind.len() > 1 { "smaller " } else { "" },
+                );
+                columns.line(out, Some(row.number), row.allocated_bytes, &text);
+            }
         }
-        let _ = writeln!(out, "{}", rule("└", "┴", "┘"));
     }
 }
 
@@ -585,6 +618,12 @@ mod tests {
             Layout::default().place(Path::new("/Users/me/x")),
             "/Users/me/x"
         );
+
+        assert!(layout.holds_everything(Path::new("/")));
+        assert!(layout.holds_everything(Path::new("/Users")));
+        assert!(layout.holds_everything(Path::new("/Users/me")));
+        assert!(!layout.holds_everything(Path::new("/Users/me/work")));
+        assert!(!layout.holds_everything(Path::new("/Applications")));
 
         assert_eq!(fit("short".into(), 16), "short");
         assert_eq!(

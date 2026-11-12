@@ -104,9 +104,9 @@ fn cli_deep_reports_json_text_and_rejects_bad_sizes() {
     assert_eq!(analysis["kinds"][0]["locations"], 1);
     let avenues = analysis["avenues"].as_array().unwrap();
     assert_eq!(avenues[0]["number"], 1);
-    assert_eq!(avenues[0]["item"], "Node dependencies");
+    assert_eq!(avenues[0]["kind"], "Node dependencies (node_modules)");
     assert_eq!(avenues[0]["effect"], "grows_back");
-    assert_eq!(avenues[1]["item"], "File");
+    assert_eq!(avenues[1]["kind"], "Other files and folders");
     assert_eq!(avenues[1]["path"].as_str().unwrap(), big.to_str().unwrap());
     assert_eq!(avenues[1]["effect"], "your_call");
     assert!(value["issues"].as_array().unwrap().is_empty());
@@ -118,35 +118,39 @@ fn cli_deep_reports_json_text_and_rejects_bad_sizes() {
     assert!(text.contains("a/b/c/d/big.bin"), "{text}");
     assert!(text.contains("Node dependencies (node_modules)"), "{text}");
     assert!(text.contains("Largest files"), "{text}");
-    // The numbered list closes the report: one bordered table per outcome,
-    // with the home directory written as `~`.
+    // The numbered list closes the report as a tree: outcome, kind with how
+    // to remove it, then numbered paths with the home directory as `~`.
     let list = text.split("What can go").nth(1).expect("numbered list");
-    assert!(list.contains("\nGrows back · "), "{text}");
-    assert!(list.contains("\nYour call · "), "{text}");
-    assert!(list.contains("│ # │ Item"), "{text}");
-    let first = list.lines().find(|line| line.starts_with("│ 1 │"));
-    let first = first.expect("row one");
-    assert!(first.contains("Node dependencies"), "{text}");
-    assert!(first.contains("~/tree/app/node_modules"), "{text}");
+    assert!(list.contains("Grows back · "), "{text}");
+    assert!(list.contains("Your call · "), "{text}");
+    assert!(
+        list.contains("Node dependencies (node_modules) · dw clean projects PATH"),
+        "{text}"
+    );
+    let numbered = |text: &str, number: &str| {
+        text.lines()
+            .find(|line| line.split_whitespace().next() == Some(number))
+            .map(str::to_owned)
+    };
+    let first = numbered(list, "1").expect("row one");
+    assert!(first.ends_with("└─ ~/tree/app/node_modules"), "{text}");
+    let second = numbered(list, "2").expect("row two");
+    assert!(second.ends_with("└─ ~/tree/a/b/c/d/big.bin"), "{text}");
 
-    // A narrow reader gets paths shortened in the middle, never a wider table.
+    // A narrow reader gets paths shortened in the middle, never longer rows.
     let narrow = Command::new(env!("CARGO_BIN_EXE_dw"))
         .env("HOME", temp.path())
-        .env("COLUMNS", "56")
+        .env("COLUMNS", "34")
         .args(["deep", path, "--min-size", "0.125M"])
         .output()
         .unwrap();
     let narrow = String::from_utf8(narrow.stdout).unwrap();
-    let table: Vec<&str> = narrow
-        .lines()
-        .filter(|line| line.starts_with(['│', '┌', '├', '└']))
-        .collect();
-    assert!(!table.is_empty(), "{narrow}");
-    assert!(
-        table.iter().all(|line| line.chars().count() <= 56),
-        "{narrow}"
-    );
-    assert!(table.iter().any(|line| line.contains('…')), "{narrow}");
+    let narrow = narrow.split("What can go").nth(1).expect("numbered list");
+    for number in ["1", "2"] {
+        let row = numbered(narrow, number).expect("numbered row");
+        assert!(row.chars().count() <= 34, "{narrow}");
+        assert!(row.contains('…'), "{narrow}");
+    }
 
     assert_eq!(
         run(&["deep", path, "--min-size", "lots"]).status.code(),

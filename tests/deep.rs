@@ -1,6 +1,6 @@
 use drivewalker::{
     DeepOptions, Effect, ScanOptions,
-    deep::{Avenue, Node},
+    deep::{Avenue, Node, branches},
     scan,
 };
 use std::{fs, path::Path};
@@ -201,27 +201,29 @@ fn avenues_number_what_can_go_by_outcome_without_overlap() {
     });
     let rows = &analysis.avenues;
 
-    // Numbered from one, by outcome and then by size.
+    // Numbered from one in the order drawn: by outcome, then the kinds that
+    // hold most, each named in the words of the by-kind totals.
     let listed: Vec<(usize, &str, Effect)> = rows
         .iter()
-        .map(|row| (row.number, row.item, row.effect))
+        .map(|row| (row.number, row.kind, row.effect))
         .collect();
     assert_eq!(
         listed,
         [
             (1, "Trash", Effect::StaysFreed),
-            (2, "Installer", Effect::StaysFreed),
-            (3, "Node dependencies", Effect::GrowsBack),
-            (4, "Node dependencies", Effect::GrowsBack),
-            (5, "File", Effect::YourCall),
-            (6, "Application", Effect::YourCall),
-            (7, "Folder", Effect::YourCall),
+            (2, "Installers and staged updates", Effect::StaysFreed),
+            (3, "Node dependencies (node_modules)", Effect::GrowsBack),
+            (4, "Node dependencies (node_modules)", Effect::GrowsBack),
+            (5, "Other files and folders", Effect::YourCall),
+            (6, "Other files and folders", Effect::YourCall),
+            (7, "Application bundles", Effect::YourCall),
         ]
     );
     assert_eq!(rows[0].path, root.join(".Trash"));
     assert_eq!(rows[1].path, root.join("Downloads/Setup.dmg"));
     assert_eq!(rows[4].path, root.join("films/film.mp4"));
-    assert_eq!(rows[5].path, root.join("Tool.app"));
+    assert_eq!(rows[5].path, root.join("work"));
+    assert_eq!(rows[6].path, root.join("Tool.app"));
     assert!(rows.iter().all(|row| !row.how.is_empty()));
 
     // A location of at least the threshold has its own row; the smaller ones
@@ -273,14 +275,17 @@ fn installed_tools_are_the_owners_call_never_regenerable() {
         "prefix/lib/node_modules",
         ".bun/install/global/node_modules",
     ] {
-        assert_eq!(row(rows, &root.join(path)).item, "Global packages");
+        assert_eq!(
+            row(rows, &root.join(path)).kind,
+            "Globally installed packages"
+        );
     }
     for path in [".rustup/toolchains/stable", ".nvm/versions/node/v24"] {
-        assert_eq!(row(rows, &root.join(path)).item, "Toolchain");
+        assert_eq!(row(rows, &root.join(path)).kind, "Language toolchains");
     }
     assert_eq!(
-        row(rows, &root.join("support/com.vendor.app")).item,
-        "Folder"
+        row(rows, &root.join("support/com.vendor.app")).kind,
+        "Other files and folders"
     );
     assert!(
         analysis
@@ -288,5 +293,73 @@ fn installed_tools_are_the_owners_call_never_regenerable() {
             .iter()
             .all(|kind| !kind.label.starts_with("Node dependencies")
                 && !kind.label.starts_with("Application"))
+    );
+}
+
+#[test]
+fn rows_of_a_kind_form_a_tree_of_the_folders_they_share() {
+    let temp = fixture();
+    let root = temp.path().join("tree");
+    put(root.join("media/shows/a.bin"), 400 * KIB);
+    put(root.join("media/films/b.bin"), 300 * KIB);
+    put(root.join("solo/c.bin"), 500 * KIB);
+    let report = measured(&root);
+    let analysis = report.deep(DeepOptions {
+        min_bytes: Some(128 * KIB as u64),
+        top: 10,
+    });
+    let rows = &analysis.avenues;
+    assert!(rows.iter().all(|row| row.kind == "Other files and folders"));
+
+    // Everything comes back under the one folder that holds it all. Beneath
+    // it, largest first at every level: the shared folder outweighs the lone
+    // file. A shared path is written once and the rows under it are relative.
+    let tree = branches(rows);
+    assert_eq!(tree.len(), 1);
+    assert_eq!((tree[0].path.clone(), tree[0].row), (root.clone(), None));
+    let [media, solo] = tree[0].children.as_slice() else {
+        panic!("two branches under the root: {tree:?}");
+    };
+    assert_eq!(
+        (media.path.as_path(), media.row),
+        (Path::new("media"), None)
+    );
+    assert_eq!(
+        media.allocated_bytes,
+        media
+            .children
+            .iter()
+            .map(|c| c.allocated_bytes)
+            .sum::<u64>()
+    );
+    let beneath: Vec<(&Path, Option<usize>)> = media
+        .children
+        .iter()
+        .map(|child| (child.path.as_path(), child.row))
+        .collect();
+    assert_eq!(
+        beneath,
+        [
+            (Path::new("shows/a.bin"), Some(0)),
+            (Path::new("films/b.bin"), Some(1)),
+        ]
+    );
+    assert_eq!(
+        (solo.path.as_path(), solo.row),
+        (Path::new("solo/c.bin"), Some(2))
+    );
+
+    // Rows are numbered down the tree, so numbers read top to bottom.
+    let numbered: Vec<(usize, &Path)> = rows
+        .iter()
+        .map(|row| (row.number, row.path.strip_prefix(&root).unwrap()))
+        .collect();
+    assert_eq!(
+        numbered,
+        [
+            (1, Path::new("media/shows/a.bin")),
+            (2, Path::new("media/films/b.bin")),
+            (3, Path::new("solo/c.bin")),
+        ]
     );
 }

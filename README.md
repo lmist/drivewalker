@@ -66,47 +66,48 @@ container reports as used. The report has six parts:
 - **Largest files** and **Not measured**: the latter groups unreadable locations
   by cause and says whether Full Disk Access or `sudo` would include them.
 - **What can go**: the closing list, numbered so a row can be referred to by
-  its number. One bordered table per outcome, each row giving item, path and
-  size:
+  its number. It is a compact tree: the outcome of deleting, then each kind
+  with its total and how to remove it, then the paths:
 
   ```text
-  Stays freed · 8.2 GiB · nothing recreates it and nothing of yours is lost
-  ┌───┬───────────────────┬──────────────────────────────────────────┬──────┐
-  │ # │ Item              │ Path                                     │  GiB │
-  ├───┼───────────────────┼──────────────────────────────────────────┼──────┤
-  │ 1 │ Simulators        │ /System/Volu…_iOSSimulatorRuntime        │  8.2 │
-  └───┴───────────────────┴──────────────────────────────────────────┴──────┘
+   #   GiB
+      10.8  Stays freed · nothing recreates it and nothing of yours is lost
+       8.2  ├─ Simulator runtimes and devices · xcrun simctl, or Xcode settings
+   1   8.2  │  └─ /System/Volumes/Data/System/Library/AssetsV2/com_apple_MobileAsset_iOSSimulatorRuntime
+       2.6  └─ Container and VM disk images · prune inside the tool
+   2   2.6     └─ ~/Library/Containers/com.docker.docker
 
-  Grows back · 18.1 GiB · a build, install or launch recreates it
-  ┌───┬───────────────────┬──────────────────────────────────────────┬──────┐
-  │ # │ Item              │ Path                                     │  GiB │
-  ├───┼───────────────────┼──────────────────────────────────────────┼──────┤
-  │ 2 │ Cache folder      │ ~/Library/Caches                         │ 10.4 │
-  │ 3 │ Node dependencies │ 344 smaller locations in ~               │  7.7 │
-  └───┴───────────────────┴──────────────────────────────────────────┴──────┘
+      34.6  Grows back · a build, install or launch recreates it
+      34.6  └─ Cache folders · dw clean caches, or delete
+   3  10.4     ├─ ~/Library/Caches
+       6.0     ├─ ~/work
+   4   3.8     │  ├─ search/vendor/models/.cache
+   5   2.2     │  └─ notes/tmp/cache
+   6  18.2     └─ … 3642 smaller locations in ~
 
-  Your call · 6.6 GiB · applications, tools, history and your own files
-  ┌───┬───────────────────┬──────────────────────────────────────────┬──────┐
-  │ # │ Item              │ Path                                     │  GiB │
-  ├───┼───────────────────┼──────────────────────────────────────────┼──────┤
-  │ 4 │ Application       │ /Applications/Big.app                    │  4.5 │
-  │ 5 │ File              │ ~/Movies/film.mp4                        │  2.1 │
-  └───┴───────────────────┴──────────────────────────────────────────┴──────┘
+      10.9  Your call · applications, tools, history and your own files
+       6.4  ├─ Other files and folders · review before deleting
+   7   4.3  │  ├─ ~/Pictures/exports
+   8   2.1  │  └─ ~/Movies/film.mp4
+       4.5  └─ Application bundles · uninstall if unused
+   9   4.5     └─ /Applications/Big.app
   ```
 
-  A recognised location of at least `--min-size` has its own row and the
-  smaller ones of its kind share one. The `--top` largest unrecognised files
-  and folders follow as your call. Rows are ordered by outcome, then size, and
-  never overlap: a folder counts only the bytes no other row has claimed, so
-  the sizes add up. Regenerable data inside system or package-manager
-  locations (`/Library`, `/opt`, `/System`, …) is totalled by kind but not
-  offered, and unrecognised contents of those locations are never listed.
-  The home directory is written as `~`, sizes share the unit of the largest
-  row, and paths are shortened in the middle to fit `$COLUMNS` or the
-  terminal; piped output keeps them whole. Numbers belong to one report; a
-  later run may order rows differently. The list is a report, not a plan:
-  `dw clean` still decides what it may delete, and `--json` carries the same
-  rows as `analysis.avenues`, each with how to remove it.
+  A line with a number is a row to pick; a line without one is a heading and
+  its size is the total beneath it. A recognised location of at least
+  `--min-size` has its own row and the smaller ones of its kind share one. The
+  `--top` largest unrecognised files and folders follow as your call. Rows that
+  lie together on disk sit under the folder they share, written once, largest
+  first at every level; numbers run top to bottom. Rows never overlap: a
+  folder counts only the bytes no other row has claimed, so the sizes add up.
+  Regenerable data inside system or package-manager locations (`/Library`,
+  `/opt`, `/System`, …) is totalled by kind but not offered, and unrecognised
+  contents of those locations are never listed. The home directory is written
+  as `~`, sizes share one unit, and paths are shortened in the middle to fit
+  `$COLUMNS` or the terminal; piped output keeps them whole. Numbers belong to
+  one report; a later run may order rows differently. The list is a report,
+  not a plan: `dw clean` still decides what it may delete, and `--json`
+  carries the same rows, in the same order, as `analysis.avenues`.
 
 `--min-size` accepts `K`, `M`, `G` or `T` and defaults to 0.5% of the measured
 total. `--top N` (1–64, default 20) sets the length of each ranking. Application
@@ -242,5 +243,6 @@ worker limits, bounded retained rankings, and drill-down after deleting a fixtur
 Deep tests cover reporting at arbitrary depth after the tree is deleted, threshold
 summaries, kind totals without double counting, and grouped unreadable locations.
 They also cover the numbered list: its order, shared rows for small locations,
-rows that do not overlap, and installed tools never being offered as regenerable.
+rows that do not overlap, the tree of shared folders, and installed tools never
+being offered as regenerable.
 A unit test checks that bulk directory reads agree with per-entry inspection.
